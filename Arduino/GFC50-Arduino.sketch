@@ -1,0 +1,262 @@
+#include <SoftwareSerial.h>
+
+//  This is for an Arduino Nano.
+//
+//  It converts the Roland GFC-50 from just sending "Program Changes" to "Control Change" messages.
+//  Why?  I wanted to use the GFC-50 for a) Bluetooth page turner, b) Send CC messages to AxeFX
+//  By ripping out the original main board, and soldering the pins to the Arduino breadboard, and running
+//  this GFC50 app on an iPad, I now have a page turner with Up/Down, Next/Prev Song & Start/Stop (5 buttons)
+//  The A/B switch is used to switch between page turner, and normal Footswitch CC
+//  Also support Long Hold on all buttons
+// 
+//  Bank A    
+//    Buttons: 1-5 => CC 1-5
+//    Buttons: 1-5 => CC 10-15 (long hold)
+// 
+//  Bank B
+//    Buttons: 1-5 => CC 11-15
+//    Buttons: 1-5 => CC 20-25 (long hold)
+//
+//    Up Button: 40
+//    Down Button: 41
+//
+//  LED on GFC50 not connected.
+//
+// Hardware setup - see *Pin assignments bellow
+//
+//  https://wiki.keyestudio.com/KS0547_Keyestudio_NANO_PLUS_Development_Board_Compatible_with_Arduino_NANO%28Black_and_Eco-friendly%29
+
+const int altToggleButton = 0; // note: button (from 0-5), not pin 
+const int upButton = 7;
+const int downButton = 6;
+
+const unsigned long debounceTime = 60;  
+const unsigned long longHoldTime = 560; 
+
+// Define switch pins
+// GFC-50
+//   Buttons 0,1,2,3,4                                            (D2,D3,D4, D5,D6)
+//   Right most button (5) toggles add 6 to midi control channel  (D7)
+// two small buttons next to LED are buttons (6,7)                (D8,D9)
+const int digitPinCount = 8;   // 6 footswitch + 2 finger switch  (D2..D9)
+const int btTxPin = 10;        //                                 (D10)
+const int btRxPin = 11;        //                                 (D11)
+const int midiTxPin = 0;      //                                  (D0)
+const int midiRxPin = 1;      //                                  (D1)
+const int greenLedPin = 12;      //                               (D12)
+const int yellowLedPin = 13;      //                               (D13)
+
+
+// ControlChange:  <midiControlChannel> : <midiBaseControlNumber + Button(0-5) + (altTogglePin ? 8 : 0)> : <midiControlValue>
+const int midiControlChannel = 11;
+const int midiBaseControlNumber = 0;
+const int midiControlValue = 0;
+
+const int midiAltOffset = 10;       // i.e. 0..8, 10..18
+const int midiLongHoldOffset = 20;  // i.e. 20..28, 30..38
+
+const int upButtonControlNumber = 40;
+const int downButtonControlNumber = 41;
+
+const int baseDigitalPin = 2; // 0,1 used for serial
+
+bool switchedToAlt = false;  // Toggle state for alt config (right most switch on hardware board)
+
+// Time tracking for button bounce
+unsigned long lastPressTimes[] = {0, 0, 0,  0, 0, 0,  0, 0, 0,};
+bool switchPressed[] = {false, false, false,  false, false, false,  false, false, false};
+
+// Bluetooth setup 
+SoftwareSerial midiSerial(midiTxPin, midiRxPin);
+SoftwareSerial btSerial(btTxPin, btRxPin);
+
+void sendATCommand(String command) {
+  btSerial.print(command); // Send the command to the HM-10
+  btSerial.print("\r\n"); // Ensure the command is followed by carriage return and newline
+  Serial.print("Sent: ");
+  Serial.println(command);
+  
+  // Wait for a response from the HM-10
+  delay(500); // Wait for 500ms (adjust if needed)
+  
+  // Print the response from the HM-10 to the Serial Monitor
+  while (btSerial.available()) {
+    char c = btSerial.read();
+    Serial.write(c);
+  }
+  Serial.println(); // Newline after the response
+}
+
+void setup() {
+
+  Serial.begin(115200);     // Debug channel (Default)
+  Serial.println("GFC-50 Startup");
+
+  midiSerial.begin(31250);  // MIDI output port
+  btSerial.begin(9600);     // Bluetooth HC-05 
+
+  // Set up switch pins as inputs
+  for (int i = 0; i < digitPinCount; i++) {
+    pinMode(baseDigitalPin+i, INPUT_PULLUP);
+  }
+
+  pinMode(yellowLedPin, OUTPUT);
+  pinMode(greenLedPin, OUTPUT);
+
+  switchedToAlt = true;
+  toggleAltMode(); // Init LED to false
+
+  Serial.println("GFC-50 Initialised");
+
+  // Reset BlueTooth
+  /*Serial.println("Renewing BlueTooth");
+  // Allow some time for the HM-10 to initialize
+  delay(1000); 
+  // Check if the HM-10 is responding to AT commands
+  sendATCommand("AT");  // Send the reset command to the HM-10
+  sendATCommand("AT+VERR?");
+  sendATCommand("AT+RESET");
+  sendATCommand("AT+RENEW");*/
+}
+
+void sendToMidi(byte channel, byte control, byte value) {
+  midiSerial.write(0xB0 | (channel & 0x0F));  // Control Change status byte
+  midiSerial.write(control);                  // Control number
+  midiSerial.write(value);                    // Control value
+}
+
+void sendToBT(byte channel, byte control, byte value) {
+  btSerial.write(0xB0 | (channel & 0x0F));  // Control Change status byte
+  btSerial.write(control);                  // Control number
+  btSerial.write(value);                    // Control value
+}
+
+void toggleLed(int pinNumber, bool on) {
+  digitalWrite(pinNumber, on ? LOW : HIGH); // sets the digital pin 13 on
+}
+
+void toggleAltMode() {
+    switchedToAlt = !switchedToAlt;
+    Serial.print("  AltMidi = ");
+    Serial.println(switchedToAlt);
+    toggleLed(greenLedPin, !switchedToAlt);
+    toggleLed(yellowLedPin, switchedToAlt);
+}
+
+void sendMidi(int buttonNum, int midiControlChannel, int controlNumber, int midiControlValue) {
+  sendToMidi(midiControlChannel,controlNumber,midiControlValue);
+  sendToBT(midiControlChannel,controlNumber,midiControlValue);
+  Serial.print("  Footswitch ");
+  Serial.print(buttonNum);
+  Serial.print("  pressed. CC #");
+  Serial.print(controlNumber);
+  Serial.println("  sent");
+}
+
+void processButton(int buttonNum /* button, not pin */) {
+
+  Serial.print("Button ");
+  Serial.print(buttonNum);
+  Serial.println(" pressed");
+
+  if(buttonNum == altToggleButton) {
+    toggleAltMode();
+    return;
+  }
+
+  if(buttonNum == upButton) {
+    Serial.println("  Up Button");
+    sendMidi(buttonNum, midiControlChannel,upButtonControlNumber,midiControlValue);
+    return; // Not used
+  }
+
+  if(buttonNum == downButton) {
+    Serial.println("  Down Button");
+    sendMidi(buttonNum, midiControlChannel,downButtonControlNumber,midiControlValue);
+    return; // Not used
+  }
+
+  // Else.. it's a footswitch...
+  int controlNumber = midiBaseControlNumber + buttonNum;
+
+  if (switchedToAlt) {
+    controlNumber += midiAltOffset;
+  }
+
+  sendMidi(buttonNum, midiControlChannel,controlNumber,midiControlValue);
+}
+
+void processLongHoldButton(int buttonNum /* button, not pin */) {
+
+  Serial.print("Button ");
+  Serial.print(buttonNum);
+  Serial.println(" long hold");
+
+  if(buttonNum == altToggleButton) {
+    toggleAltMode();
+    return;
+  }
+
+  if(buttonNum == upButton) {
+    Serial.println("  Up Button (not used)");
+    return; // Not used
+  }
+
+  if(buttonNum == downButton) {
+    Serial.println("  Down Button (not used)");
+    return; // Not used
+  }
+
+  // Else.. it's a footswitch...
+  int controlNumber = midiBaseControlNumber + buttonNum;
+
+  if (switchedToAlt) {
+    controlNumber += midiAltOffset;
+  }
+
+  controlNumber += midiLongHoldOffset;
+
+  sendMidi(buttonNum, midiControlChannel,controlNumber,midiControlValue);
+}
+
+void loop() {
+
+  if (btSerial.available()) {
+    char c = btSerial.read();
+    Serial.write(c); // Echo it to the Serial Monitor
+  }
+
+  // Monitor the switches
+  for (int i = 0; i < digitPinCount; i++) {
+    int pin = baseDigitalPin+i;
+
+    int buttonState = digitalRead(pin);
+
+    if (buttonState == LOW && !switchPressed[i]) {
+      // Button pressed
+      //Serial.println("Down");
+      lastPressTimes[i] = millis();
+      switchPressed[i] = true;
+    }
+
+    if (buttonState == HIGH && switchPressed[i]) {
+      // Button released, check press duration for normal, or long press
+      unsigned long pressDuration = millis() - lastPressTimes[i];
+      
+      if (pressDuration > debounceTime && pressDuration < longHoldTime) {
+        Serial.print(pressDuration);
+        Serial.println("ms.  Released (click)");
+        processButton(i);
+      }
+      else if (pressDuration > longHoldTime) {
+        Serial.print(pressDuration);
+        Serial.println("ms.  Released (long hold)");
+        processLongHoldButton(i);
+      }
+      else {
+        //Serial.println("  Released (nada)");
+      }
+      switchPressed[i] = false;
+    }
+  }
+}
